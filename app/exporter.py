@@ -21,6 +21,7 @@ class MetricExporter:
         group_by,
         targets,
         metric_type,
+        record_types=None,
         tag_filters=None,  # Added tag_filters parameter
     ):
         self.polling_interval_seconds = polling_interval_seconds
@@ -31,6 +32,7 @@ class MetricExporter:
         self.aws_assumed_role_name = aws_assumed_role_name
         self.group_by = group_by
         self.metric_type = metric_type  # Store metrics
+        self.record_types = record_types
         self.tag_filters = tag_filters  # Store tag filters
         self.dimension_alias = {}  # Store dimension value alias per group
 
@@ -39,6 +41,11 @@ class MetricExporter:
 
         # For now we only support exporting one type of cost (Usage)
         self.labels.add("ChargeType")
+
+        # If record_types is not provided, use the default value
+        if record_types is None:
+            record_types = []
+        record_types.append("Usage")
 
         if group_by["enabled"]:
             for group in group_by["groups"]:
@@ -49,6 +56,7 @@ class MetricExporter:
                         "map": group["alias"]["map"],
                         "label": group["alias"]["label_name"],
                     }
+                    self.labels.add(group["alias"]["label_name"])
 
                 self.labels.add(group["label_name"])
 
@@ -70,12 +78,15 @@ class MetricExporter:
                 logging.error(e)
                 continue
 
-    def get_aws_account_session_via_iam_user(self, account_id):
-        sts_client = boto3.client(
-            "sts",
-            aws_access_key_id=self.aws_access_key,
-            aws_secret_access_key=self.aws_access_secret,
-        )
+    def get_aws_account_session_via_iam_role(self, account_id):
+        if self.aws_access_key and self.aws_access_secret:
+            sts_client = boto3.client(
+                "sts",
+                aws_access_key_id=self.aws_access_key,
+                aws_secret_access_key=self.aws_access_secret,
+            )
+        else:
+            sts_client = boto3.client("sts")
 
         assumed_role_object = sts_client.assume_role(
             RoleArn=f"arn:aws:iam::{account_id}:role/{self.aws_assumed_role_name}",
@@ -83,21 +94,6 @@ class MetricExporter:
         )
 
         return assumed_role_object["Credentials"]
-
-    def get_aws_account_session_default(self, account_id):
-        sts_client = boto3.client("sts")
-
-        # If aws_assumed_role_name is empty or None, use instance profile credentials
-        if not self.aws_assumed_role_name:
-            # Return None to indicate to use instance profile credentials directly
-            return None
-        else:
-            assumed_role_object = sts_client.assume_role(
-                RoleArn=f"arn:aws:iam::{account_id}:role/{self.aws_assumed_role_name}",
-                RoleSessionName="AssumeRoleSession1",
-            )
-
-            return assumed_role_object["Credentials"]
 
     def query_aws_cost_explorer(self, aws_client, group_by, tag_filters=None):
         end_date = datetime.today()
@@ -110,7 +106,7 @@ class MetricExporter:
                 groups.append({"Type": group["type"], "Key": group["key"]})
 
         # Build the base filter with RECORD_TYPE
-        base_filter = {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Usage"]}}
+        base_filter = {"Dimensions": {"Key": "RECORD_TYPE", "Values": self.record_types}}
 
         # Include tag filters if provided
         if tag_filters:
@@ -147,18 +143,9 @@ class MetricExporter:
         return response["ResultsByTime"]
 
     def fetch(self, aws_account):
-        if self.aws_access_key == "" and self.aws_access_secret == "":
-            aws_credentials = self.get_aws_account_session_default(aws_account["Publisher"])
-        else:
-            aws_credentials = self.get_aws_account_session_via_iam_user(aws_account["Publisher"])
-
-        # If aws_credentials is None, use instance profile directly
-        if aws_credentials is None:
-            aws_client = boto3.client(
-                "ce",
-                region_name="us-east-1",
-            )
-        else:
+        if self.aws_assumed_role_name:
+            # assume role first
+            aws_credentials = self.get_aws_account_session_via_iam_role(aws_account["Publisher"])
             aws_client = boto3.client(
                 "ce",
                 aws_access_key_id=aws_credentials["AccessKeyId"],
@@ -166,6 +153,21 @@ class MetricExporter:
                 aws_session_token=aws_credentials["SessionToken"],
                 region_name="us-east-1",
             )
+        else:
+            if self.aws_access_key and self.aws_access_secret:
+                aws_client = boto3.client(
+                    "ce",
+                    aws_access_key_id=self.aws_access_key,
+                    aws_secret_access_key=self.aws_access_secret,
+                    region_name="us-east-1",
+                )
+            else:
+                # no credentials are provided via the config file
+                # rely on the default credentials chain in boto3
+                aws_client = boto3.client(
+                    "ce",
+                    region_name="us-east-1",
+                )
 
         # Pass tag_filters to query_aws_cost_explorer
         cost_response = self.query_aws_cost_explorer(
